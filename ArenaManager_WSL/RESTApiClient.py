@@ -1,3 +1,5 @@
+# Unchanged from legacy code
+
 import httplib2
 import json
 

@@ -1,4 +1,4 @@
-import sys, os, math, requests, json, keyboard, cv2, subprocess
+import sys, os, math, requests, paramiko, json, keyboard, cv2, subprocess
 from PyQt5.QtGui import *
 from PyQt5.QtCore import *
 from PyQt5.QtWidgets import *
@@ -9,211 +9,164 @@ import numpy as np
 import ConfigReader
 import NDIImageSender
 import ObjectManager
-import SCOTSDeploy
 
-ENABLE_PROJECTION = False   # Ventuz + NDI
-ENABLE_TRACKING   = True   # Motive + localization server
-ENABLE_CAMERA     = False    # DirectShow webcam
+CONFIG_FILE = "robot.cfg"
+config_reader = ConfigReader.ConfigReader(CONFIG_FILE)
 
-config_file = "robot.cfg"
-config_reader = ConfigReader.ConfigReader(config_file)
+CAMERA_RESOLUTION = (1280, 720) # 16:9
+ENABLE_CAMERA = False
+ENABLE_PROJECTION = False
 
-localization_server_url = "http://192.168.1.194:12345/OptiTrackRestServer"
+default_object_sizes = {
+    # In Meters
+    "GO2":("0.31", "0.70"), 
+    "Target":("1", "1"), 
+    "Obstacle":("3.0", "0.4")
+}
 
-manual_control_port = ":1234"
-
-camera_resolution = (1280, 720)  # 16:9
-
-# rigid body name in Motive for the quadruped
-ROBOT_NAME = SCOTSDeploy.ROBOT_OBJECT_NAME  # "GO2-001"
-
-ROBOT_RENDER_ANGLE_OFFSET = 0
-
-global render_robot
-# Hidden by default ONLY because the canvas is projected onto the arena floor
-# where the real robot already is. With projection off there is no reason to
-# hide it -- and doing so was a regression: originally "GO2-001" never matched
-# the "DeepRacer" test, so it skipped this gate and always drew.
-render_robot = not ENABLE_PROJECTION
-
-# Synthesis geometry comes from ObjectManager. Set this True to additionally
-# pull in marker-tracked obstacles that physically exist in the arena but were
-# never drawn in the GUI (an ObstacleCar, a box with a rigid body). Leave it
-# False if every obstacle is drawn, which avoids a network read entirely.
-MERGE_TRACKED_OBSTACLES = True
-
-# NOTE: the Obstacle default was ("3.0", "0.4") for the DeepRacer arena, which
-# was much larger. In a 3 m arena a 3.0 m wide obstacle spans the full width
-# and, once inflated, seals it off completely -> empty winning set.
-default_object_sizes = {"GO2": ("0.25", "0.35"), "Target": ("0.8", "0.8"), "Obstacle": ("0.6", "0.2")}
-
-
-def str2list(strList):
-    return [float(i.replace(" ", "")) for i in strList.split(",")]
-
-
-x_lb = str2list(config_reader.get_value_string("system.states.first_symbol"))
-x_ub = str2list(config_reader.get_value_string("system.states.last_symbol"))
-x_eta = str2list(config_reader.get_value_string("system.states.quantizers"))
-
-print("bounds:", x_lb, x_ub, x_eta)
-
-
-if __name__ == "__main__":
-    # ndiImgSender = NDIImageSender.NDIImageSender(b'My_PNG', 10)  # initialize Ventuz projection
-    if ENABLE_CAMERA:
-        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-        if cap.isOpened() == False:
-            print("connection to camera device failed")
-        else:
-            cap.set(3, camera_resolution[0])
-            cap.set(4, camera_resolution[1])
-    else:
-        # Do not even open the device when the camera is disabled -- under WSL
-        # this always fails and the failed-but-not-None capture object then
-        # confuses CameraThread.
-        cap = None
+# Start here!
+if __name__=="__main__":
+    #TODO does not work!
+    ndiImgSender = NDIImageSender.NDIImageSender(b'My_PNG', 10) # initialize Ventuz projection
+    #TODO does not work!
+    cap = cv2.VideoCapture(0,cv2.CAP_DSHOW)
+    if cap.isOpened()==False: print("connection to camera device failed")
+    cap.set(3,CAMERA_RESOLUTION[0])
+    cap.set(4,CAMERA_RESOLUTION[1])
+    # Load background image
     img_background = Image.open("background.png")
 
+
+# Read config file (robot.cfg)
+
+def string_to_float_list(strList):
+    # Takes a string like "12, 3, 5, 6" and returns a list [12,3,5,6] 
+    return [float(i.replace(" ","")) for i in strList.split(",")]
+
+# 2D State space lower bound
+X_LB = string_to_float_list(config_reader.get_value_string("system.states.first_symbol"))
+# 2D State space upper bound
+X_UB = string_to_float_list(config_reader.get_value_string("system.states.last_symbol"))
+# Grid step size
+X_ETA = string_to_float_list(config_reader.get_value_string("system.states.quantizers"))
+
+
+ROBOT_NAME = str(config_reader.get_value_string("optitrack.robot_name"))
+LOCALIZATION_SERVER_URL = str(config_reader.get_value_string("optitrack.objects_server_url"))
 SIM_WIDTH = int(config_reader.get_value_string("simulation.window_width"))
 SIM_HEIGHT = int(config_reader.get_value_string("simulation.window_height"))
-path_tail_length = int(config_reader.get_value_string("simulation.path_tail_length"))
-draw_tail = False
-path_tail = []
+PATH_TAIL_LENGTH = int(config_reader.get_value_string("simulation.path_tail_length"))
+DRAW_TAIL = bool(config_reader.get_value_string("simulation.DRAW_TAIL"))
+DRAW_ROBOT = bool(config_reader.get_value_string("simumlation.DRAW_ROBOT"))
+
 
 
 # run motive program
 def start_motive():
-    # motive = subprocess.Popen("C:/Users/CUBLab/Desktop/Motive_Best_Calibration.lnk",stdout=subprocess.PIPE,shell=True)
-    motive = subprocess.Popen("C:/Users/CUBLab/Desktop/Motive_Updated_Calibration_Dimmed_1_8_2026.lnk", stdout=subprocess.PIPE, shell=True)
+    motive = subprocess.Popen("C:/Users/CUBLab/Desktop/Motive_Updated_Calibration_Dimmed_1_8_2026.lnk",stdout=subprocess.PIPE,shell=True)
     return motive
-
 
 # run localization server
 def start_localization_server():
     localization_server = subprocess.Popen("D:/Workspace/OptiTrackRESTServer/start_admin.bat")
     return localization_server
 
-
 # run ventuz
 def start_ventuz():
-    ventuz = subprocess.Popen("D:/Workspace/NDIRestServer/ventuz/NDIRestServerRecveiver/Presentations/NDIRestServerReceiver.vpr", stdout=subprocess.PIPE, shell=True)
+    ventuz = subprocess.Popen("D:/Workspace/NDIRestServer/ventuz/NDIRestServerRecveiver/Presentations/NDIRestServerReceiver.vpr",stdout=subprocess.PIPE,shell=True)
     return ventuz
 
-
-def kill_go2_controller():
-    """Stop the closed-loop deployment script running inside WSL."""
-    SCOTSDeploy.kill_closed_loop()
-
-
-def controller_bdd_path():
-    """Where go2_controller.bdd lands after a successful synthesis."""
-    return os.path.join(SCOTSDeploy.SCOTS_WSL_DIR, "go2_controller.bdd")
-
-
-def controller_exists():
-    """True if there is a controller on disk to deploy.
-
-    Lets the Run button work against a controller synthesised in an earlier
-    session, without forcing a re-run of the transition relation.
-    """
-    try:
-        return os.path.isfile(controller_bdd_path())
-    except Exception:
-        return False
-
-
+# pull from the REST server where the Optitrack data is held
 def get_objects():
     try:
-        return json.loads(requests.get(localization_server_url).text)
+        return json.loads(requests.get(LOCALIZATION_SERVER_URL).text)
     except Exception as e:
-        print("unable to retrieve from localization server: " + str(e))
-
+        print("unable to retrieve from localization server: "+str(e))
 
 # function to convert a rectangle defined by (x,y) positon, (w,l) size and angle in rad to polygon coordinates
-def get_polygon(x, y, w, l, angle):
-    c, s = math.cos(angle), math.sin(angle)
-    coords = [(l / 2.0, w / 2.0), (l / 2.0, -w / 2.0), (-l / 2.0, -w / 2.0), (-l / 2.0, w / 2.0)]
-    return [(c * x_val - s * y_val + x, s * x_val + c * y_val + y) for (x_val, y_val) in coords]
+def get_polygon(x, y, w, l, angle): 
+    c,s = math.cos(angle),math.sin(angle)
+    coords = [(l/2.0, w/2.0), (l/2.0, -w/2.0), (-l/2.0, -w/2.0), (-l/2.0, w/2.0)]
+    return [(c*x_val-s*y_val+x, s*x_val+c*y_val+y) for (x_val,y_val) in coords]
 
-
-_last_draw_report = None
-
-def _report_draw(objects):
-    """Print the object set once whenever it changes.
-
-    Nothing rendering is almost always one of: the localization server is
-    unreachable, it is reachable but empty, or every entry reads "untracked".
-    Those look identical on a blank canvas, so name them explicitly.
-    """
-    global _last_draw_report
-    if objects is None:
-        report = "unreachable"
-    elif not objects:
-        report = "reachable, 0 objects"
-    else:
-        tracked = [n for n, v in objects.items() if v != "untracked"]
-        untracked = [n for n, v in objects.items() if v == "untracked"]
-        report = "drawable=%s" % (sorted(tracked) or "NONE")
-        if untracked:
-            report += "  untracked=%s" % sorted(untracked)
-    if report != _last_draw_report:
-        print("[canvas] localization server: %s" % report)
-        _last_draw_report = report
-
-
+# function that returns a PIL image for projection based on location and sizes from localization server
 def draw_simulation():
     global path_tail
     objects = get_objects()
-    _report_draw(objects)
-    if objects is None:
-        # img is not assigned yet at this point -- referencing it here was the
-        # "local variable 'img' referenced before assignment" error.
-        return img_background.copy().transpose(Image.FLIP_TOP_BOTTOM)
+
+    # Set path_tail to none if robot cannot be located.
     if ROBOT_NAME not in objects:
         path_tail = []
+
     img = img_background.copy()
     draw = ImageDraw.Draw(img)
-    for i in range(len(objects.keys()) - 1, -1, -1):
+
+    if objects == None: return img
+
+    # 0 <= i <= len(object.keys())-1
+    # Final value is exclusive, and i counts down to -1.
+    for i in range(len(objects.keys())-1, -1, -1):
+
+        # Define object name as key value
         name = list(objects.keys())[i]
+
+        # Only proceed if the object is actually being tracked
         if objects[name] != "untracked":
+
+            # The object state is written as a key value pair with the value being a list of values
             values = objects[name].split(',')
+            # only proceed if there are 7 values
             if len(values) != 7: continue
-            x, y = fields_to_world(values)
-            x, y = world_to_canvas(x, y)
-            w = float(values[6]); l = float(values[5])
-            angle = 0
-            color = "#00FFFF"  # default color yellow
-            is_robot = (name == ROBOT_NAME) or ("GO2" in name) or ("ObstacleCar" in name)
-            if is_robot:
-                if not render_robot: continue
-                angle = (float(values[3]) + ROBOT_RENDER_ANGLE_OFFSET)
-                color = "#0000EE"
+            # Parse it
+            x = float(values[1]); y = float(values[2]); w = float(values[6]); l = float(values[5])
+            angle = (float(values[3])-math.pi/2)
+
+            # Choose color based on what type of object it is.
+
+            color = "#00FFFF" # default color
+
+            if ROBOT_NAME in name or "ObstacleCar" in name:
+                if not DRAW_ROBOT: continue
+                # Checks the last number of its name
+                if name[-1]=="1":
+                    color = "#0000EE"
+                elif name[-1]=="2":
+                    color = "#007CE8"
+
             if "Obstacle" in name:
                 color = "#EE0000"
+
             elif "Target" in name:
                 color = "#00EE00"
+
+            # Optitrack to Arena Kinematics; remember, positive X is towards the 
+            # computing server and positive Y is towards the other room.    
             [x, y] = state_world_to_arena([x, y])
-            # l is the x-extent and w the y-extent, so they must be scaled by
-            # the x and y scales respectively. The original passed [w, l],
-            # which applied the x scale to the y-extent and vice versa.
-            [l, w] = norm_world_to_arena([l, w])
+            [w, l] = norm_world_to_arena([w, l])
+
             if name == ROBOT_NAME:
-                path_tail.insert(0, (x, y))
-                if len(path_tail) > path_tail_length:
-                    path_tail = path_tail[:path_tail_length]
-                draw.polygon(get_polygon(x, y, w, l, angle), fill=color)
-            elif is_robot:
-                draw.polygon(get_polygon(x, y, w, l, angle), fill=color)
+                # The start of the tail (index 0) should be the robot's position (x,y)
+                path_tail.insert(0,(x,y))
+                # If the length of the tail is greater than the stated length, 
+                # then cut the list to 0 (implicit) to PATH_TAIL_LENGTH
+                if len(path_tail) > PATH_TAIL_LENGTH:
+                    path_tail = path_tail[:PATH_TAIL_LENGTH]
+                draw.polygon(get_polygon(x,y,w,l,angle), fill=color)
+            elif name == "ObstacleCar":
+                draw.polygon(get_polygon(x,y,w,l,angle), fill=color)
             else:
-                draw.rounded_rectangle((x - l / 2, y - w / 2, x + l / 2, y + w / 2), fill=color, radius=10)
-            draw.polygon(get_polygon(x, y, 5, 5, angle), fill="black")  # draw black dot at center
-    if path_tail != [] and draw_tail:
+                draw.rounded_rectangle((x-l/2,y-w/2,x+l/2,y+w/2), fill=color, radius=10)
+            # draw black dot at center
+            draw.polygon(get_polygon(x,y,5,5,angle), fill="black") 
+
+    # If path tail is not empty and DRAW_TAIL is true
+    if path_tail!=[] and DRAW_TAIL:
         draw.line(path_tail, width=6, fill="#0000EE", joint="curve")
-    return img.transpose(Image.FLIP_TOP_BOTTOM)
 
+    # Return the compiled image with everything drawn on it
+    return img.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
 
-def pil2pixmap(im):  # function to convert pil image to pyqt pixmap
+def pil2pixmap(im): # function to convert pil image to pyqt pixmap
     r, g, b, a = im.split()
     im = Image.merge("RGBA", (b, g, r, a))
     data = im.tobytes("raw", "RGBA")
@@ -221,101 +174,46 @@ def pil2pixmap(im):  # function to convert pil image to pyqt pixmap
     pixmap = QPixmap.fromImage(qim)
     return pixmap
 
-
-def norm_world_to_arena(norm):  # translate the size tuple in world units to pixels
-    arena_x = (norm[0]) * (SIM_WIDTH / (x_ub[0] - x_lb[0]))
-    arena_y = (norm[1]) * (SIM_HEIGHT / (x_ub[1] - x_lb[1]))
+def norm_world_to_arena(norm): # translate the size tuple in world units to pixels
+    arena_x = (norm[0])*(SIM_WIDTH/(X_UB[0] - X_LB[0]))
+    arena_y = (norm[1])*(SIM_HEIGHT/(X_UB[1] - X_LB[1]))
     return [arena_x, arena_y]
 
-
-def norm_arena_to_world(norm):  # translate the size tuple in pixels to world units
-    world_x = (norm[0]) / (SIM_WIDTH / (x_ub[0] - x_lb[0]))
-    world_y = (norm[1]) / (SIM_HEIGHT / (x_ub[1] - x_lb[1]))
+def norm_arena_to_world(norm): # translate the size tuple in pixels to world units
+    world_x = (norm[0])/(SIM_WIDTH/(X_UB[0] - X_LB[0]))
+    world_y = (norm[1])/(SIM_HEIGHT/(X_UB[1] - X_LB[1]))
     return [world_x, world_y]
 
-
-def state_world_to_arena(state):  # translate the position tuple in world units to pixels
-    arena_x = (state[0] - x_lb[0] + x_eta[0] / 2) * (SIM_WIDTH / (x_ub[0] - x_lb[0] + x_eta[0]))
-    arena_y = (state[1] - x_lb[1] + x_eta[1] / 2) * (SIM_HEIGHT / (x_ub[1] - x_lb[1] + x_eta[1]))
+def state_world_to_arena(state): # translate the position tuple in world units to pixels
+    arena_x = (state[0] - X_LB[0] + X_ETA[0]/2)*(SIM_WIDTH/(X_UB[0] - X_LB[0] + X_ETA[0]))    
+    arena_y = (state[1] - X_LB[1] + X_ETA[1]/2)*(SIM_HEIGHT/(X_UB[1] - X_LB[1] + X_ETA[1]))
     return [arena_x, arena_y]
 
-
-def state_arena_to_world(state):  # translate the position tuple in pixels to world units
-    world_x = state[0] / (SIM_WIDTH / (x_ub[0] - x_lb[0] + x_eta[0])) + x_lb[0] - x_eta[0] / 2
-    world_y = state[1] / (SIM_HEIGHT / (x_ub[1] - x_lb[1] + x_eta[1])) + x_lb[1] - x_eta[1] / 2
+def state_arena_to_world(state): # translate the position tuple in pixels to world units
+    world_x = state[0]/(SIM_WIDTH/(X_UB[0] - X_LB[0] + X_ETA[0])) + X_LB[0] - X_ETA[0]/2
+    world_y = state[1]/(SIM_HEIGHT/(X_UB[1] - X_LB[1] + X_ETA[1])) + X_LB[1] - X_ETA[1]/2
     return [world_x, world_y]
-
-def fields_to_world(values):
-    """CSV fields -> canvas (x, y). Inverse of SCOTSControlTest.parse_objects."""
-    return float(values[2]), -float(values[1])
-
-
-def world_to_fields(x, y):
-    """Canvas (x, y) -> the [1] and [2] CSV fields."""
-    return -y, x
-
-def world_to_canvas(x, y):
-    """World -> canvas axes. World +x is up-screen, world +y is left."""
-    return -y, x
-
-
-def canvas_to_world_axes(cx, cy):
-    """Inverse of the above."""
-    return cy, -cx
-
-
-def canvas_to_world(px, py):
-    cx, cy = state_arena_to_world([px, SIM_HEIGHT - py])
-    return canvas_to_world_axes(cx, cy)
-
 
 class CameraThread(QThread):
     changePixmap = pyqtSignal(QPixmap)
-
-    def __init__(self, parent=None):
-        super(CameraThread, self).__init__(parent)
-        self._running = True
-
-    def stop(self):
-        self._running = False
-
     def run(self):
-        if cap is None or not cap.isOpened():
-            return
-        while self._running:
+        while True:
             status, image = cap.read()
-            if not status:
-                self.msleep(50)
-                continue
-            image = cv2.rotate(cv2.cvtColor(cv2.resize(image, (640, 360)), cv2.COLOR_BGR2RGB), cv2.ROTATE_180)
-            self.changePixmap.emit(pil2pixmap(Image.fromarray(image).convert("RGBA")))
-
+            if status:
+                image = cv2.rotate(cv2.cvtColor(cv2.resize(image,(640,360)),cv2.COLOR_BGR2RGB),cv2.cv2.ROTATE_180)
+                self.changePixmap.emit(pil2pixmap(Image.fromarray(image).convert("RGBA")))
 
 class CanvasThread(QThread):
     changePixmap = pyqtSignal(QPixmap)
-
-    def __init__(self, parent=None):
-        super(CanvasThread, self).__init__(parent)
-        self._running = True
-
-    def stop(self):
-        self._running = False
-
     def run(self):
-        while self._running:
-            try:
-                img = draw_simulation()
-                img_bytes = bytes(np.array(img))
-                self.changePixmap.emit(pil2pixmap(img))
-                # ndiImgSender.send_image(img_bytes, SIM_WIDTH, SIM_HEIGHT)
-            except Exception as e:
-                print("[canvas] draw failed: %s" % e)
-                self.msleep(1000)
-                continue
-            self.msleep(33)
+        while True:
+            img = draw_simulation()
+            img_bytes = bytes(np.array(img))
+            self.changePixmap.emit(pil2pixmap(img))
+            ndiImgSender.send_image(img_bytes, SIM_WIDTH, SIM_HEIGHT)
 
-
-class AutoDeploy(QMainWindow):  # class for main gui window
+# Main GUI Window; massive class, generated with PyQt5
+class AutoDeploy(QMainWindow): 
     def __init__(self):
         super().__init__()
         self.object_manager = None
@@ -335,43 +233,50 @@ class AutoDeploy(QMainWindow):  # class for main gui window
 
         # setup menu bar
         self.menu = self.menuBar()
-        # create file menu
-        self.menu_file = self.menu.addMenu("File")
 
-        # create 2 actions
+        # Create File menu
+        self.menu_file = self.menu.addMenu("File")
+        # self.load_config
         self.action_load_config = QAction("Load Objects Configuration")
         self.action_load_config.setShortcut("Ctrl+O")
         self.action_load_config.triggered.connect(self.load_config)
         self.action_load_config.setEnabled(False)
         self.action_load_config.setFont(self.font)
-
+        #self.save_config
         self.action_save_config = QAction("Save Current Objects Configuration")
         self.action_save_config.setShortcut("Ctrl+S")
         self.action_save_config.triggered.connect(self.save_config)
         self.action_save_config.setEnabled(False)
         self.action_save_config.setFont(self.font)
-        # add actions to file menu
+        #Add actions to File menu
         self.menu_file.addAction(self.action_load_config)
         self.menu_file.addAction(self.action_save_config)
 
+
+        #Create Edit Menu
         self.menu_edit = self.menu.addMenu("Edit")
+        #self.undo
         self.action_undo = QAction("Undo")
         self.action_undo.setShortcut("Ctrl+Z")
         self.action_undo.triggered.connect(self.undo)
         self.action_undo.setEnabled(False)
         self.action_undo.setFont(self.font)
+        #self.delete_target
         self.action_delete_target = QAction("Delete Added Targets")
         self.action_delete_target.triggered.connect(self.delete_target)
         self.action_delete_target.setEnabled(False)
         self.action_delete_target.setFont(self.font)
+        #self.delete_obstacle
         self.action_delete_obstacle = QAction("Delete Added Obstacles")
         self.action_delete_obstacle.triggered.connect(self.delete_obstacle)
         self.action_delete_obstacle.setEnabled(False)
         self.action_delete_obstacle.setFont(self.font)
+        #self.delete_config
         self.action_delete_config = QAction("Delete All Added Objects")
         self.action_delete_config.triggered.connect(self.delete_config)
         self.action_delete_config.setEnabled(False)
         self.action_delete_config.setFont(self.font)
+        # Add actions to edit menu
         self.menu_edit.addAction(self.action_undo)
         self.menu_edit.addSeparator()
         self.menu_edit.addAction(self.action_delete_target)
@@ -379,86 +284,98 @@ class AutoDeploy(QMainWindow):  # class for main gui window
         self.menu_edit.addSeparator()
         self.menu_edit.addAction(self.action_delete_config)
 
+
+        #Create View Menu
         self.menu_view = self.menu.addMenu("View")
+        #self.toggle_camera
         self.action_toggle_camera = QAction("Toggle Camera View", self, checkable=True)
         self.action_toggle_camera.setFont(self.font)
         self.action_toggle_camera.triggered.connect(self.toggle_camera)
+        #Set default as defined
+        self.action_toggle_camera.setChecked(ENABLE_CAMERA)
+        #self.toggle_edit
         self.action_toggle_edit = QAction("Toggle Edit View", self, checkable=True)
         self.action_toggle_edit.setChecked(True)
         self.action_toggle_edit.setFont(self.font)
         self.action_toggle_edit.triggered.connect(self.toggle_edit)
+        #self.toggle_tail
         self.action_toggle_tail = QAction("Toggle Tail Visibility", self, checkable=True)
         self.action_toggle_tail.setChecked(False)
         self.action_toggle_tail.setFont(self.font)
         self.action_toggle_tail.triggered.connect(self.toggle_tail)
+        #self.toggle_robot_render
         self.action_toggle_robot_render = QAction("Toggle Go2 Rendering", self, checkable=True)
-        # match the module default rather than contradicting it
         self.action_toggle_robot_render.setChecked(render_robot)
         self.action_toggle_robot_render.setFont(self.font)
         self.action_toggle_robot_render.triggered.connect(self.toggle_robot_render)
-        self.action_toggle_camera.setChecked(ENABLE_CAMERA)
+        #Add actions to view menu
         self.menu_view.addAction(self.action_toggle_camera)
         self.menu_view.addAction(self.action_toggle_edit)
         self.menu_view.addSeparator()
         self.menu_view.addAction(self.action_toggle_tail)
         self.menu_view.addAction(self.action_toggle_robot_render)
 
+
+        #Create SCOTS Menu
         self.menu_scots = self.menu.addMenu("SCOTS")
+        #self.write_config_only
         self.action_write_config_only = QAction("Write arena_config.txt Only")
         self.action_write_config_only.triggered.connect(self.write_config_only)
         self.action_write_config_only.setEnabled(False)
         self.action_write_config_only.setFont(self.font)
+        #self.show_config
         self.action_show_config = QAction("Preview arena_config.txt")
         self.action_show_config.triggered.connect(self.show_config)
         self.action_show_config.setEnabled(False)
         self.action_show_config.setFont(self.font)
+        #Add actions to SCOTS menu
         self.menu_scots.addAction(self.action_write_config_only)
         self.menu_scots.addAction(self.action_show_config)
 
+        #Create Help Menu
         self.menu_help = self.menu.addMenu("Help")
+        #self.stop_controler
         self.action_kill_go2_controller = QAction("Kill Go2 Controller")
         self.action_kill_go2_controller.triggered.connect(self.stop_controller)
         self.action_kill_go2_controller.setFont(self.font)
+        #Add action to Help Menu
         self.menu_help.addAction(self.action_kill_go2_controller)
 
-        # setup buttons at the top
+
+
+        #Setup buttons at the top
         self.setup_complete = False
+        #self.start_environment
         self.btn_env = QPushButton("Initialize Environment", self)
         self.btn_env.clicked.connect(self.start_environment)
         self.btn_env.setFont(self.font)
-
-        # --- synthesis and deployment are separate actions -----------------
-        # Synthesis is a multi-minute offline computation that produces
-        # go2_controller.bdd. Running is a live loop that reads that file.
-        # Keeping them apart means you can re-run a controller without
-        # re-synthesising, and synthesise without immediately driving a robot.
+        # Synthesize and Run used to be combined; it is separate in this program to allow 
+        # for the running of a program twice without resynthesis.
+        #self.start_symbolic
         self.btn_synth = QPushButton("Synthesize Controller", self)
         self.btn_synth.clicked.connect(self.start_symbolic)
         self.btn_synth.setFont(self.font)
         self.btn_synth.setEnabled(False)
-
+        #self.toggle_controller
         self.btn_run = QPushButton("Run Controller", self)
         self.btn_run.clicked.connect(self.toggle_controller)
         self.btn_run.setFont(self.font)
         self.btn_run.setEnabled(False)
-
-        self.btn_manual = QPushButton("Manual Drive", self)
-        self.btn_manual.setFont(self.font)
-        self.btn_manual.clicked.connect(self.start_manual_drive)
-
-        self.btns = [self.btn_env, self.btn_synth, self.btn_run, self.btn_manual]
-
+        #Add Buttons to top
+        self.btns = [self.btn_env, self.btn_synth, self.btn_run]
         hbox_btns.addWidget(self.btn_env)
         hbox_btns.addWidget(self.btn_synth)
         hbox_btns.addWidget(self.btn_run)
         hbox_btns.addWidget(self.btn_manual)
 
         # poll the closed loop so the button resets if it exits on its own
+        # Every 1000ms, self._poll_controller will be called
         self.controller_timer = QTimer(self)
         self.controller_timer.setInterval(1000)
         self.controller_timer.timeout.connect(self._poll_controller)
 
         # setup camera view
+        # Only enable camera if defined as so
         self.camera = QLabel()
         self.camera.setAlignment(Qt.AlignCenter)
         self.thread_camera = CameraThread(self)
@@ -470,6 +387,7 @@ class AutoDeploy(QMainWindow):  # class for main gui window
             self.view_camera = False
 
         # setup canvas / simulation view
+        # Methods called when canvas is interacted with
         self.canvas = QLabel()
         self.canvas.setAlignment(Qt.AlignCenter)
         self.canvas.setPixmap(QPixmap("background.png"))
@@ -482,6 +400,7 @@ class AutoDeploy(QMainWindow):  # class for main gui window
         # setup edit view
         self.hbox_edit = QHBoxLayout()
 
+        # What kind of obstacle to place on the canvas?
         vbox_shape = QVBoxLayout()
         self.label_object_type = QLabel("Select Object Type:")
         self.label_object_type.setFont(self.font_bold)
@@ -496,12 +415,14 @@ class AutoDeploy(QMainWindow):  # class for main gui window
         vbox_shape.addWidget(self.checkbox_obstacle)
         vbox_shape.setAlignment(Qt.AlignCenter)
 
+        # Advanced Options
         vbox_dimensions = QVBoxLayout()
         self.label_dimensions = QLabel("Dimensions: (one block is size " + str(norm_arena_to_world([600 / 4, 0])[0])[:3] + ")")
         self.label_dimensions.setFont(self.font_bold)
         vbox_dimensions_info2 = QHBoxLayout()
         self.label_dimensions_info2 = QLabel("Leave Blank for Default Sizes")
         self.label_dimensions_info2.setFont(self.font)
+        #self.clear_edit_textbox
         self.btn_edit_clear = QPushButton("Clear")
         self.btn_edit_clear.setFont(self.font)
         self.btn_edit_clear.clicked.connect(self.clear_edit_textbox)
@@ -509,6 +430,7 @@ class AutoDeploy(QMainWindow):  # class for main gui window
         vbox_dimensions_info2.addStretch(1)
         vbox_dimensions_info2.addWidget(self.btn_edit_clear)
         hbox_edit_line1 = QHBoxLayout()
+        # Input goes to self.label_width
         self.label_width = QLabel("Horizontal Width: ")
         self.label_width.setFont(self.font)
         self.textbox_width = QLineEdit()
@@ -519,6 +441,7 @@ class AutoDeploy(QMainWindow):  # class for main gui window
         hbox_edit_line1.addStretch(1)
         hbox_edit_line1.addWidget(self.textbox_width)
         hbox_edit_line2 = QHBoxLayout()
+        # Input goes to self.label_height
         self.label_height = QLabel("Vertical Height: ")
         self.label_height.setFont(self.font)
         self.textbox_height = QLineEdit()
@@ -534,6 +457,7 @@ class AutoDeploy(QMainWindow):  # class for main gui window
         vbox_dimensions.addLayout(hbox_edit_line2)
         vbox_dimensions.setAlignment(Qt.AlignCenter)
 
+        # Align Everything
         self.hbox_edit.addStretch(1)
         self.hbox_edit.addLayout(vbox_shape, 2)
         self.hbox_edit.addStretch(1)
@@ -551,11 +475,12 @@ class AutoDeploy(QMainWindow):  # class for main gui window
         hbox_main.addLayout(vbox_left)
         hbox_main.addWidget(self.canvas)
 
+        # Status Bar
         self.status = self.statusBar()
         self.status.setFont(self.font)
         self.status.showMessage("Initialize Environment to Run Simulation")
 
-        # synthesis log, hidden until the first synthesis run
+        # Synthesis log, hidden until the first synthesis run
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setFont(QFont("Consolas", 9))
@@ -569,12 +494,15 @@ class AutoDeploy(QMainWindow):  # class for main gui window
         vbox.addWidget(self.log_view)
         vbox.addWidget(self.status)
 
-        self.setWindowTitle("Unitree Go2 SCOTS Automatic Deployment")
+        self.setWindowTitle("Unitree GO2 SCOTS Auto Deploy")
         self.setWindowIcon(QIcon('background.png'))
         main_widget = QWidget()
         main_widget.setLayout(vbox)
         self.setCentralWidget(main_widget)
         self.setWindowFlag(Qt.WindowMaximizeButtonHint, False)  # disable maximize button
+
+
+    # Setup over; the following are method definitions
 
     @pyqtSlot(QPixmap)
     def set_camera_image(self, pixmap):
@@ -601,8 +529,8 @@ class AutoDeploy(QMainWindow):  # class for main gui window
             self.frame_edit.hide()
 
     def toggle_tail(self, state):
-        global draw_tail
-        draw_tail = bool(state)
+        global DRAW_TAIL
+        DRAW_TAIL = bool(state)
 
     def toggle_robot_render(self, state):
         global render_robot
@@ -628,6 +556,8 @@ class AutoDeploy(QMainWindow):  # class for main gui window
         if is_all_unchecked:
             self.checked_object_type = "None"
 
+
+    # Important! Launches everything else
     def start_environment(self):  # function to start necessay software environments in sequence ~30s
         self.btn_env.setEnabled(False)
         self.motive = None
@@ -635,15 +565,19 @@ class AutoDeploy(QMainWindow):  # class for main gui window
         self.localization_server = None
         skipped = []
 
-        if ENABLE_TRACKING:
-            self.status.showMessage("Starting Motive...")
-            self.motive = subprocess.Popen(["cmd.exe", "/c", "start", "", "Motive_Best_Calibration.lnk"], cwd="/mnt/c/Users/CUBLab/Desktop", stdout=subprocess.PIPE)
+        # Start Motive!
+        self.status.showMessage("Starting Motive...")
+        self.motive = subprocess.Popen(["cmd.exe", "/c", "start", "", "Motive_Best_Calibration.lnk"], cwd="/mnt/c/Users/CUBLab/Desktop", stdout=subprocess.PIPE)
+        self.activateWindow()
+        QtTest.QTest.qWait(16000)
 
-            self.activateWindow()
-            QtTest.QTest.qWait(16000)
-        else:
-            skipped.append("Motive")
+        # Start Localization Server!
+        self.status.showMessage("Starting Localization Server...")
+        self.localization_server = subprocess.Popen(["cmd.exe", "/c", "start_admin.bat"], cwd="/mnt/d/Workspace/OptiTrackRESTServer")
+        QtTest.QTest.qWait(2000)
+        self.activateWindow()
 
+        #Start Ventuz!
         if ENABLE_PROJECTION:
             self.status.showMessage("Starting Ventuz...")
             self.ventuz = start_ventuz()
@@ -652,14 +586,7 @@ class AutoDeploy(QMainWindow):  # class for main gui window
         else:
             skipped.append("Ventuz/NDI")
 
-        if ENABLE_TRACKING:
-            self.status.showMessage("Starting Localization Server...")
-            self.localization_server = subprocess.Popen(["cmd.exe", "/c", "start_admin.bat"], cwd="/mnt/d/Workspace/OptiTrackRESTServer")
-            QtTest.QTest.qWait(2000)
-            self.activateWindow()
-        else:
-            skipped.append("localization server")
-
+        # Make options available
         self.setup_complete = True
         self.action_load_config.setEnabled(True)
         self.action_save_config.setEnabled(True)
@@ -672,21 +599,30 @@ class AutoDeploy(QMainWindow):  # class for main gui window
         self.btn_synth.setEnabled(True)
         self.frame_edit.setEnabled(True)
 
-        # Run is available immediately if a controller from an earlier session
-        # is still on disk -- no need to re-synthesise to redeploy.
-        self.controller_ready = controller_exists()
+        #TODO Could cause problems later... should check if file exists before running
         self.btn_run.setEnabled(self.controller_ready)
 
+        # Referring to ObjectManager.py
+        # Instantiate an ObjectManager
         self.object_manager = ObjectManager.ObjectManager()
+
+
+        # This adoption block runs once, when the environment is initialized
+        # If left side is true, return get_objects()
         stale = get_objects() or {}
+        # Add n to the list if it satisfies the predicate, if its a Target/Obstacle 
+        # and not managed by the object_manager.
         orphans = [n for n in stale
                    if ("Target" in n or "Obstacle" in n) and n not in self.object_manager.objects]
+        # If non-empty, update object_manager with 'orphan' key:value pair 
         if orphans:
-            self.object_manager.objects.update({n: stale[n] for n in orphans})
+            self.object_manager.objects.update({n:stale[n] for n in orphans})
             print("adopted %d orphaned object(s) from a previous session: %s"
                   % (len(orphans), orphans))
+            
         self.thread_canvas.start()
 
+        # True if you can reach the objects
         reachable = get_objects() is not None
         msg = "Environment initialized. Tracking %s." % ("OK" if reachable else "NOT reachable")
         if skipped:
@@ -725,31 +661,19 @@ class AutoDeploy(QMainWindow):  # class for main gui window
     def delete_config(self):
         self.object_manager.deleteAll()
 
-    # -----------------------------------------------------------------------
-    # SCOTS -- synthesis
-    # -----------------------------------------------------------------------
     def collect_geometry(self):
-        """Geometry to synthesise against.
 
-        ObjectManager is authoritative for whatever the user drew -- it is
-        in-process and correct the moment a drag ends, with no network round
-        trip and no race against the REST POST landing.
+        # Objects tracked by Optitrack
+        try:
+            tracked = get_objects()
+        except Exception as e:
+            print("tracked-obstacle merge skipped: " + str(e))
 
-        OptiTrack is consulted only for physically tracked obstacles that
-        carry markers and were therefore never drawn in the GUI. That read
-        is best-effort: if the server is down, synthesis still proceeds on
-        the drawn geometry.
-        """
-        tracked = None
-        if MERGE_TRACKED_OBSTACLES:
-            try:
-                tracked = get_objects()
-            except Exception as e:
-                print("tracked-obstacle merge skipped: " + str(e))
+        # Combining GUI and Optitrack objects
         return SCOTSDeploy.collect_arena(
             self.object_manager,
             tracked_objects=tracked,
-            include_tracked_obstacles=MERGE_TRACKED_OBSTACLES)
+            include_tracked_obstacles=True)
 
     def _build_config_text(self):
         """Render arena_config.txt from the GUI geometry. Raises on no target."""
@@ -757,7 +681,7 @@ class AutoDeploy(QMainWindow):  # class for main gui window
         if not targets:
             raise RuntimeError("No Target placed on the arena.")
         return SCOTSDeploy.build_config_text(targets, obstacles,
-                                             state_lb=x_lb, state_ub=x_ub), targets, obstacles
+                                             state_lb=X_LB, state_ub=X_UB), targets, obstacles
 
     def write_config_only(self):
         """Write arena_config.txt without running synthesis."""
@@ -806,8 +730,8 @@ class AutoDeploy(QMainWindow):  # class for main gui window
 
         self.thread_scots = SCOTSDeploy.SynthesisThread(
             geometry_provider=self.collect_geometry,
-            state_lb=x_lb,
-            state_ub=x_ub,
+            state_lb=X_LB,
+            state_ub=X_UB,
             parent=self)
         self.thread_scots.log.connect(self.append_log)
         self.thread_scots.finished_ok.connect(self.on_synthesis_done)
@@ -892,20 +816,6 @@ class AutoDeploy(QMainWindow):  # class for main gui window
             self.btn_synth.setEnabled(True)
             self.status.showMessage("Closed loop exited (code %s)." % code)
 
-    # -----------------------------------------------------------------------
-
-    def start_manual_drive(self):
-        global path_tail
-        path_tail = []
-        self.btn_manual.setEnabled(False)
-        self.status.showMessage("Manual Drive Started, use arrow keys to navigate, press esc to quit")
-        subprocess.Popen([sys.executable, "KeyboardControl.py"])
-        keyboard.add_hotkey("esc", self.exit_manual_drive)
-
-    def exit_manual_drive(self):
-        keyboard.unhook_all_hotkeys()
-        self.btn_manual.setEnabled(True)
-        self.status.showMessage("Manual Drive Exited")
 
     def canvas_press_event(self, event):  # get object ready for mouse drag event
         if self.setup_complete:
@@ -980,7 +890,7 @@ class AutoDeploy(QMainWindow):  # class for main gui window
         except Exception:
             pass
 
-        if self.setup_complete and ENABLE_TRACKING:
+        if self.setup_complete:
             # These are Windows executables reached through cmd.exe, matching
             # how start_environment launches them. A bare Popen of a .bat path
             # raises FileNotFoundError on Linux.
@@ -996,19 +906,12 @@ class AutoDeploy(QMainWindow):  # class for main gui window
                     except Exception:
                         pass
 
+        
+
 
 if __name__ == "__main__":
-    import signal
     App = QApplication(sys.argv)
     window = AutoDeploy()
-
-    signal.signal(signal.SIGINT, lambda *a: window.close())
-
-    # give the interpreter a slice of time so the signal handler can run
-    timer = QTimer()
-    timer.start(200)
-    timer.timeout.connect(lambda: None)
-
     window.show()
     window.setMaximumSize(window.size())
     sys.exit(App.exec())

@@ -9,7 +9,7 @@ import numpy as np
 import ConfigReader
 import NDIImageSender
 import ObjectManager
-import SCOTSDeploy
+import ArenaManager_WSL.SCOTSDeploy as SCOTSDeploy
 
 ENABLE_PROJECTION = False   # Ventuz + NDI
 ENABLE_TRACKING   = True   # Motive + localization server

@@ -8,4 +8,6 @@ pybind11
 pillow
 Requests
 Keyboard
+parglare
+paramiko
 unitree_sdk2py
