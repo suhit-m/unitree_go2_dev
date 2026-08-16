@@ -128,8 +128,7 @@ if __name__ == "__main__":
     mgr  = scots.Cudd()
     ctrl = scots.SymbolicSet(mgr, "scots_dev/go2_controller.bdd")
     target = scots.SymbolicSet(mgr, "scots_dev/go2_target.bdd")
-    # ctrl = scots.SymbolicSet(mgr, "scots_dev/go2_controller.bdd")
-    # target = scots.SymbolicSet(mgr, "scots_dev/go2_target.bdd")
+
     print("Check 1")
 
     while optitrack_x is None or optitrack_y is None or optitrack_yaw is None:
