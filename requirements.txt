@@ -1,0 +1,7 @@
+unitree_sdk2py
+numpy
+cyclonedds
+opencv-python
+scipy
+pathfinding3d
+pybind11

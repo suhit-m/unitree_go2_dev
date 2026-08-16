@@ -1,0 +1,390 @@
+% =========================================================================
+%  SCOTS Go2 — Closed-Loop Simulation using BDD files
+%
+%  Reads all go2_*.bdd files, parses grid parameters from headers,
+%  loads the controller via SymbolicSet, and simulates the closed-loop
+%  Go2 dynamics.
+%
+%  test.cpp parameters assumed:
+%    ODE:   xx = u  (first order, x' = u)
+%    tau  = 0.3s,  nint = 5
+%    H_ell = diag([0.5, 0.5, 0.2]),  c_ell = [0, 0, 0]
+% =========================================================================
+
+clear; clc; close all;
+
+% =========================================================================
+% USER CONFIGURATION
+% =========================================================================
+BDD_DIR      = '\\wsl.localhost\Ubuntu-20.04\home\cublab\Workspace-Linux\unitree_go2_dev\go2_dev\scots_dev\BDD Files\2026-6-10';
+SCOTS_MFILES = '\\wsl.localhost\Ubuntu-20.04\home\cublab\Workspace-Linux\unitree_go2_dev\scots\mfiles';
+
+% --- Obstacles -----------------------------------------------------------
+% Obstacles are NOT recoverable from the BDDs (go2_ss.bdd only stores the
+% FREE space, i.e. state space minus whatever remPolytope removed). So list
+% them here, matching the remPolytope(...) calls in test.cpp.
+%
+% Each obstacle is an axis-aligned box [xmin xmax ymin ymax] in the x-y
+% plane, unconstrained in yaw -- exactly like a 4-row axis-aligned
+% remPolytope( ... , scots::OUTER) call.
+%
+% To paste a SCOTS h1 vector straight from test.cpp, wrap it in scots_box().
+% The axis-aligned convention is h1 = [-xmin, xmax, -ymin, ymax], so:
+scots_box = @(h) [-h(1), h(2), -h(3), h(4)];   % h1 -> [xmin xmax ymin ymax]
+
+obstacles = {
+    % >>> REPLACE these with your actual test.cpp obstacles <<<
+    [0.5,1,-2, 2];     % box given directly as [xmin xmax ymin ymax]
+
+  % scots_box([-0.5, 1.0, 2.0, 2.0]);   % or paste an h1 vector directly
+};
+% -------------------------------------------------------------------------
+% =========================================================================
+
+% Add SCOTS mfiles to path
+if ~isempty(SCOTS_MFILES)
+    addpath(genpath(SCOTS_MFILES));
+    addpath(fullfile(SCOTS_MFILES, 'mexfiles'));
+end
+
+% =========================================================================
+% 1.  BDD header parser
+% =========================================================================
+function info = parse_bdd_header(filepath)
+    info = struct('dim',0,'eta',[],'first',[],'last',[],'npts',[],'lb',[],'ub',[]);
+    fid = fopen(filepath,'r');
+    if fid < 0, error('Cannot open: %s', filepath); end
+    while true
+        line = fgetl(fid);
+        if ~ischar(line), break; end
+        if ~startsWith(line,'#scots'), continue; end
+        if contains(line,'dimension:')
+            info.dim = sscanf(line,'#scots dimension: %d');
+        elseif contains(line,'grid parameter eta:')
+            info.eta = sscanf(line,'#scots grid parameter eta: %f %f %f %f %f %f')';
+        elseif contains(line,'coordinate of first grid point:')
+            info.first = sscanf(line,'#scots coordinate of first grid point: %f %f %f %f %f %f')';
+        elseif contains(line,'coordinate of last grid point:')
+            info.last = sscanf(line,'#scots coordinate of last grid point: %f %f %f %f %f %f')';
+        elseif contains(line,'number of grid points (per dim):')
+            info.npts = sscanf(line,'#scots number of grid points (per dim): %d %d %d')';
+        end
+    end
+    fclose(fid);
+    if ~isempty(info.first) && ~isempty(info.eta)
+        info.lb = info.first - info.eta/2;
+        info.ub = info.last  + info.eta/2;
+    end
+end
+
+% =========================================================================
+% 2.  Load and parse all BDD headers
+% =========================================================================
+fprintf('Parsing BDD headers...\n');
+ss_info   = parse_bdd_header(fullfile(BDD_DIR, 'go2_ss.bdd'));
+tgt_info  = parse_bdd_header(fullfile(BDD_DIR, 'go2_target.bdd'));
+ctrl_info = parse_bdd_header(fullfile(BDD_DIR, 'go2_controller.bdd'));
+
+% State grid
+eta_s = ss_info.eta;
+lb_s  = ss_info.lb;
+ub_s  = ss_info.ub;
+
+% Input grid — extracted from controller BDD (dim = state_dim + input_dim)
+sdim    = ss_info.dim;                          % 3
+idim    = ctrl_info.dim - sdim;                 % 3
+eta_u   = ctrl_info.eta  (sdim+1:end);
+first_u = ctrl_info.first(sdim+1:end);
+last_u  = ctrl_info.last (sdim+1:end);
+npts_u  = round((last_u - first_u) ./ eta_u) + 1;
+lb_u    = first_u - eta_u/2;
+ub_u    = last_u  + eta_u/2;
+
+fprintf('  State space: eta=[%.3f %.3f %.4f], pts=%d\n', ...
+    eta_s(1), eta_s(2), eta_s(3), prod(ss_info.npts));
+fprintf('  Input space: eta=[%.3f %.3f %.4f], pts=%d\n', ...
+    eta_u(1), eta_u(2), eta_u(3), prod(npts_u));
+fprintf('  Obstacles:   %d defined\n', numel(obstacles));
+
+% =========================================================================
+% 3.  Load controller via SymbolicSet
+% =========================================================================
+fprintf('\nLoading controller BDD...\n');
+ctrl = SymbolicSet(fullfile(BDD_DIR, 'go2_controller.bdd'));
+fprintf('  Controller loaded.\n');
+
+% =========================================================================
+% 4.  Target ellipsoid (H and c not in BDD — match test.cpp manually)
+% =========================================================================
+H_ell = diag([1/0.5, 0.5, 0.001]);
+c_ell = [0.0; 0.0; 0.0];
+
+in_target = @(x) ( H_ell(1,1)*(x(1)-c_ell(1))^2 + ...
+                   H_ell(2,2)*(x(2)-c_ell(2))^2 ) <= 1.0;
+
+in_domain = @(x) all(x(:) >= lb_s(:)) && all(x(:) <= ub_s(:));
+
+% In-obstacle test: true if (x,y) lies in ANY obstacle box (yaw ignored)
+in_obstacle = @(x) any(cellfun(@(b) ...
+    x(1) >= b(1) && x(1) <= b(2) && x(2) >= b(3) && x(2) <= b(4), obstacles));
+
+% =========================================================================
+% 5.  ODE — go2_post (matches test.cpp: xx = u, RK4, tau=0.3, nint=5)
+% =========================================================================
+tau  = 0.3;
+nint = 5;
+dt   = tau / nint;
+
+rhs = @(x, u) [u(1)*cos(x(3)) - u(2)*sin(x(3)); ...
+               u(1)*sin(x(3)) + u(2)*cos(x(3)); ...
+               u(3)];   % x' = u  (first order)
+
+function xn = go2_post(x, u, dt, nint, rhs_fn)
+    xn = x;
+    for i = 1:nint
+        k1 = rhs_fn(xn,            u);
+        k2 = rhs_fn(xn + dt/2*k1,  u);
+        k3 = rhs_fn(xn + dt/2*k2,  u);
+        k4 = rhs_fn(xn + dt*k3,    u);
+        xn = xn + dt/6*(k1 + 2*k2 + 2*k3 + k4);
+    end
+    xn(3) = mod(xn(3), 2*pi);   % wrap yaw to [0, 2*pi]
+end
+
+% =========================================================================
+% 6.  Controller query — getInputs returns all valid inputs; pick min norm
+% =========================================================================
+function u = query_ctrl(x, ctrl_obj, rhs_fn, tau, nint, dt, c_ell)
+    try
+        inputs = ctrl_obj.getInputs(x);
+    catch
+        u = zeros(3,1);
+        return;
+    end
+    if isempty(inputs)
+        u = zeros(3,1);
+        return;
+    end
+    % pick input whose next state is closest to target centre
+    best_dist = inf;
+    best_u = inputs(1,:)';
+    for i = 1:size(inputs,1)
+        xn = go2_post(x, inputs(i,:)', dt, nint, rhs_fn);
+        d = (xn(1)-c_ell(1))^2 + (xn(2)-c_ell(2))^2;
+        if d < best_dist
+            best_dist = d;
+            best_u = inputs(i,:)';
+        end
+    end
+    u = best_u;
+end
+% =========================================================================
+% 7.  Initial conditions — spread around the arena
+% =========================================================================
+x0_list = {
+    [-4.0; -4.0;  0.0   ],
+    [-4.0;  4.0;  0.0   ],
+    [ 4.0; -4.0;  pi    ],
+    [ 4.0;  4.0;  pi    ],
+    [ 0.0;  3.0;  pi*1.5],
+    [-3.0;  0.0;  0.0   ],
+};
+
+T_max  = 200;
+colors = lines(numel(x0_list));
+
+trajectories = cell(numel(x0_list), 1);
+inputs_log   = cell(numel(x0_list), 1);
+reached      = false(numel(x0_list), 1);
+left_domain  = false(numel(x0_list), 1);
+hit_obstacle = false(numel(x0_list), 1);
+
+% =========================================================================
+% 8.  Run simulations
+% =========================================================================
+fprintf('\nRunning simulations...\n');
+for r = 1:numel(x0_list)
+    x    = x0_list{r};
+    traj = x';
+    ulg  = [];
+
+    for k = 1:T_max
+        u = query_ctrl(x, ctrl, rhs, tau, nint, dt, c_ell);
+
+        % Check if state left winning set (zero input returned)
+        if all(u == 0)
+            left_domain(r) = true;
+            break;
+        end
+
+        ulg(end+1,:)  = u'; %#ok<AGROW>
+        x             = go2_post(x, u, dt, nint, rhs);
+        traj(end+1,:) = x'; %#ok<AGROW>
+
+        % Collision check — should never trigger if the controller is sound,
+        % but flags any model mismatch between this RK4 and test.cpp.
+        if in_obstacle(x)
+            hit_obstacle(r) = true;
+            break;
+        end
+
+        if in_target(x)
+            reached(r) = true;
+            break;
+        end
+    end
+
+    trajectories{r} = traj;
+    inputs_log{r}   = ulg;
+    fprintf('  Run %d | x0=[%5.1f %5.1f %5.1f°] | steps=%3d | target=%s | domain=%s | hit=%s\n', ...
+        r, x0_list{r}(1), x0_list{r}(2), rad2deg(x0_list{r}(3)), ...
+        size(traj,1)-1, mat2str(reached(r)), mat2str(~left_domain(r)), mat2str(hit_obstacle(r)));
+end
+
+% =========================================================================
+% 9.  Figure 1 — X-Y trajectories
+% =========================================================================
+figure('Name','SCOTS Go2 — Closed-Loop Trajectories', ...
+       'Position',[60 60 860 720], 'Color',[0.12 0.12 0.15]);
+ax = axes('Color',[0.08 0.08 0.11], 'XColor',[0.7 0.7 0.7], ...
+          'YColor',[0.7 0.7 0.7], 'GridColor',[0.3 0.3 0.3], 'GridAlpha',0.4);
+hold on;
+
+% Arena boundary
+rectangle('Position',[lb_s(1) lb_s(2) (ub_s(1)-lb_s(1)) (ub_s(2)-lb_s(2))], ...
+          'EdgeColor',[0.5 0.5 0.5],'LineWidth',1.5,'LineStyle','--','FaceColor','none');
+
+% Obstacles (drawn before trajectories so paths render on top)
+for o = 1:numel(obstacles)
+    b  = obstacles{o};
+    xv = [b(1) b(2) b(2) b(1)];
+    yv = [b(3) b(3) b(4) b(4)];
+    if o == 1
+        fill(xv, yv, [0.85 0.25 0.25], 'FaceAlpha',0.30, ...
+             'EdgeColor',[0.95 0.45 0.45], 'LineWidth',1.5, 'DisplayName','Obstacle');
+    else
+        fill(xv, yv, [0.85 0.25 0.25], 'FaceAlpha',0.30, ...
+             'EdgeColor',[0.95 0.45 0.45], 'LineWidth',1.5, 'HandleVisibility','off');
+    end
+end
+
+% Target ellipse
+th = linspace(0,2*pi,300);
+ex = c_ell(1) + cos(th)/sqrt(H_ell(1,1));
+ey = c_ell(2) + sin(th)/sqrt(H_ell(2,2));
+fill(ex, ey, [0.2 0.8 0.4],'FaceAlpha',0.2, ...
+     'EdgeColor',[0.2 0.9 0.4],'LineWidth',2,'DisplayName','Target');
+plot(c_ell(1), c_ell(2), '+','Color',[0.2 0.9 0.4],'MarkerSize',12, ...
+     'LineWidth',2,'HandleVisibility','off');
+
+% Trajectories
+arrow_skip = 4;
+for r = 1:numel(x0_list)
+    traj = trajectories{r};
+    plot(traj(:,1), traj(:,2), '-','Color',colors(r,:), ...
+         'LineWidth',1.8,'DisplayName',sprintf('Run %d',r));
+    plot(traj(1,1),   traj(1,2),   'o','Color',colors(r,:), ...
+         'MarkerSize',9,'MarkerFaceColor',colors(r,:),'HandleVisibility','off');
+    plot(traj(end,1), traj(end,2), 's','Color',colors(r,:), ...
+         'MarkerSize',9,'MarkerFaceColor','w','LineWidth',1.5,'HandleVisibility','off');
+    for k = 1:arrow_skip:size(traj,1)-1
+        dp = 0.25*[cos(traj(k,3)), sin(traj(k,3))];
+        quiver(traj(k,1), traj(k,2), dp(1), dp(2), 0, ...
+               'Color', min(colors(r,:)*0.8+0.1,1), 'MaxHeadSize',2.5, ...
+               'LineWidth',0.7,'HandleVisibility','off');
+    end
+end
+
+xlabel('x_{pos} [m]','FontSize',13,'Color',[0.85 0.85 0.85]);
+ylabel('y_{pos} [m]','FontSize',13,'Color',[0.85 0.85 0.85]);
+title({'SCOTS Go2 — Closed-Loop (BDD Controller)', ...
+       sprintf('eta_s=[%.2f,%.2f,%.4f]  |  eta_u=[%.3f,%.3f,%.3f]', ...
+               eta_s(1),eta_s(2),eta_s(3), eta_u(1),eta_u(2),eta_u(3))}, ...
+      'Color',[0.85 0.85 0.85],'FontSize',12);
+axis equal;
+xlim([lb_s(1)-0.3 ub_s(1)+0.3]);
+ylim([lb_s(2)-0.3 ub_s(2)+0.3]);
+grid on;
+legend('Location','northeast','FontSize',10, ...
+       'TextColor',[0.85 0.85 0.85],'Color',[0.15 0.15 0.2]);
+set(gca,'FontSize',11);
+
+
+%{
+% =========================================================================
+% 10.  Figure 2 — States + inputs for Run 1
+% =========================================================================
+r_plot = 6;
+traj   = trajectories{r_plot};
+ulg    = inputs_log{r_plot};
+t_x    = (0:size(traj,1)-1) * tau;
+t_u    = (0:size(ulg, 1)-1) * tau;
+
+figure('Name','SCOTS Go2 — Run 1: States & Inputs', ...
+       'Position',[940 60 920 700]);
+
+subplot(3,3,1);
+plot(t_x, traj(:,1),'b-','LineWidth',1.5); grid on;
+yline(c_ell(1)-1/sqrt(H_ell(1,1)),'r--','LineWidth',1);
+yline(c_ell(1)+1/sqrt(H_ell(1,1)),'r--','LineWidth',1);
+ylabel('x_{pos} [m]','FontSize',11); xlabel('t [s]','FontSize',10);
+title('Position x','FontSize',11);
+
+subplot(3,3,2);
+plot(t_x, traj(:,2),'b-','LineWidth',1.5); grid on;
+yline(c_ell(2)-1/sqrt(H_ell(2,2)),'r--','LineWidth',1);
+yline(c_ell(2)+1/sqrt(H_ell(2,2)),'r--','LineWidth',1);
+ylabel('y_{pos} [m]','FontSize',11); xlabel('t [s]','FontSize',10);
+title('Position y','FontSize',11);
+
+subplot(3,3,3);
+plot(t_x, rad2deg(traj(:,3)),'b-','LineWidth',1.5); grid on;
+ylabel('\psi [°]','FontSize',11); xlabel('t [s]','FontSize',10);
+title('Heading \psi','FontSize',11);
+
+% Ellipsoid distance
+dist2c = sqrt( H_ell(1,1)*(traj(:,1)-c_ell(1)).^2 + ...
+               H_ell(2,2)*(traj(:,2)-c_ell(2)).^2 + ...
+               H_ell(3,3)*(traj(:,3)-c_ell(3)).^2 );
+subplot(3,3,4:5);
+plot(t_x, dist2c,'k-','LineWidth',1.5); grid on;
+yline(1,'r--','LineWidth',1.2,'Label','Target boundary');
+ylabel('Ellipsoid dist','FontSize',11); xlabel('t [s]','FontSize',10);
+title('Weighted distance to target  \sqrt{\Sigma H_{ii}(x_i-c_i)^2}','FontSize',11);
+
+subplot(3,3,6);
+stairs(t_u, ulg(:,1),'r-','LineWidth',1.4); grid on;
+ylabel('v_x [m/s]','FontSize',11); xlabel('t [s]','FontSize',10);
+ylim([lb_u(1)-0.1 ub_u(1)+0.1]);
+title('Input v_x','FontSize',11);
+
+subplot(3,3,7);
+stairs(t_u, ulg(:,2),'m-','LineWidth',1.4); grid on;
+ylabel('v_y [m/s]','FontSize',11); xlabel('t [s]','FontSize',10);
+ylim([lb_u(2)-0.05 ub_u(2)+0.05]);
+title('Input v_y','FontSize',11);
+
+subplot(3,3,8:9);
+stairs(t_u, ulg(:,3),[0.1 0.6 0.1],'LineWidth',1.4); grid on;
+ylabel('v_{yaw} [rad/s]','FontSize',11); xlabel('t [s]','FontSize',10);
+ylim([lb_u(3)-0.2 ub_u(3)+0.2]);
+title('Input v_{yaw}','FontSize',11);
+
+sgtitle(sprintf('Run 1  |  x_0=[%.1f, %.1f, %.0f°]  |  BDD controller', ...
+    x0_list{r_plot}(1), x0_list{r_plot}(2), rad2deg(x0_list{r_plot}(3))), ...
+    'FontSize',12,'FontWeight','bold');
+%}
+% =========================================================================
+% 11.  Console summary
+% =========================================================================
+fprintf('\n%-5s  %-28s  %-6s  %-8s  %-9s  %-7s\n', ...
+    'Run','x0=[x, y, psi°]','Steps','Target','In domain','Hit obs');
+fprintf('%s\n', repmat('-',1,72));
+for r = 1:numel(x0_list)
+    x0 = x0_list{r};
+    fprintf('%-5d  [%5.1f, %5.1f, %6.1f°]       %-6d  %-8s  %-9s  %s\n', ...
+        r, x0(1), x0(2), rad2deg(x0(3)), ...
+        size(trajectories{r},1)-1, ...
+        mat2str(reached(r)), mat2str(~left_domain(r)), mat2str(hit_obstacle(r)));
+end
+fprintf('%s\n', repmat('-',1,72));
