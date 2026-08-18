@@ -6,9 +6,9 @@ from PyQt5 import QtTest
 from PIL import Image, ImageDraw
 import numpy as np
 
-import ConfigReader
-import NDIImageSender
-import ObjectManager
+import util.ConfigReader as ConfigReader
+import ArenaManager_WSL.NDIImageSender as NDIImageSender
+import ArenaManager_WSL.ObjectManager as ObjectManager
 
 CONFIG_FILE = "robot.cfg"
 config_reader = ConfigReader.ConfigReader(CONFIG_FILE)
@@ -82,6 +82,31 @@ def get_objects():
         return json.loads(requests.get(LOCALIZATION_SERVER_URL).text)
     except Exception as e:
         print("unable to retrieve from localization server: "+str(e))
+
+# Intended to be used with parse_objects()
+def parse_dict_values(string):
+    values = string.split(",")
+    if len(values) != 7:
+        print("Warning! There should be 7 values within the following: %s" % string )
+    return values
+
+# Intended to be used with get_objects()
+# returns 3 dicts with elements formatted as such:
+# "name": [id, x, y, 0, 0, w, l] 
+# Only x, y, w, l really matter
+def parse_objects(dict):
+    robots, obstacles, targets = dict()
+    for key in dict:
+        if "GO2" in key:
+            robots[key] = parse_dict_values(dict[key])
+        if "Obstacle" in key:
+            obstacles[key] = parse_dict_values(dict[key])
+        if "Target" in key:
+            targets[key] = parse_dict_values(dict[key])
+    return robots, obstacles, targets
+
+
+
 
 # function to convert a rectangle defined by (x,y) positon, (w,l) size and angle in rad to polygon coordinates
 def get_polygon(x, y, w, l, angle): 
@@ -661,23 +686,11 @@ class AutoDeploy(QMainWindow):
     def delete_config(self):
         self.object_manager.deleteAll()
 
-    def collect_geometry(self):
-
-        # Objects tracked by Optitrack
-        try:
-            tracked = get_objects()
-        except Exception as e:
-            print("tracked-obstacle merge skipped: " + str(e))
-
-        # Combining GUI and Optitrack objects
-        return SCOTSDeploy.collect_arena(
-            self.object_manager,
-            tracked_objects=tracked,
-            include_tracked_obstacles=True)
+    
 
     def _build_config_text(self):
         """Render arena_config.txt from the GUI geometry. Raises on no target."""
-        targets, obstacles = self.collect_geometry()
+        robots, targets, obstacles = parse_objects(get_objects())
         if not targets:
             raise RuntimeError("No Target placed on the arena.")
         return SCOTSDeploy.build_config_text(targets, obstacles,

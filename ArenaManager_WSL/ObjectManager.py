@@ -1,8 +1,14 @@
+# Unchanged from legacy code
+
 import json
-import RESTApiClient
+import util.RESTApiClient as RESTApiClient
 
 objects_server_url = "http://192.168.1.194:12345/OptiTrackRestServer"
 object_client = RESTApiClient.RESTApiClient(objects_server_url)
+
+# Each element in the 'objects' dict should be formatted as:
+# name: "id,x,y"
+# Note that the value is a string, not a list.
 
 # ObjectManager in charge of adding and deleting virtual objects in arena
 class ObjectManager:
@@ -15,8 +21,10 @@ class ObjectManager:
         objects = []
         for name in self.objects:
             values = self.objects[name].split(',')
-            xobj = float(values[1]); yobj = float(values[2])
-            wobj = 0.1; lobj = 0.1
+            xobj = float(values[1])
+            yobj = float(values[2])
+            wobj = 0.1
+            lobj = 0.1
             xlower = xobj-wobj; xupper = xobj+wobj
             ylower = yobj-lobj; yupper = yobj+lobj
             if x>=xlower and x<=xupper and y>=ylower and y<=yupper:
@@ -24,8 +32,9 @@ class ObjectManager:
         return objects
 
     def addObject(self, name, values):
+        if object_client.restPUTjson({name:values}) == None:
+            raise ValueError("Could not upload to REST server!")
         self.objects[name] = values
-        object_client.restPUTjson({name:values})
     
     def undo(self):
         if len(self.objects) != 0:
@@ -59,6 +68,9 @@ class ObjectManager:
 
     def getObjectsString(self):
         return json.dumps(self.objects)
+
+    def getObjectsDict(self):
+        return self.objects
 
     def deleteByType(self, object_type):
         target_objects = []
