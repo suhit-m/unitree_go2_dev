@@ -237,12 +237,41 @@ class CanvasThread(QThread):
             self.changePixmap.emit(pil2pixmap(img))
             ndiImgSender.send_image(img_bytes, SIM_WIDTH, SIM_HEIGHT)
 
+class ObjectThread(QThread):
+    objects = pyqtSignal(dict)
+    
+    def __init__(self, parent):
+        super.__init__(parent)  
+        self.running = True
+
+    # Right now, assuming the following method runs repeatedly, it publishes any new tracked objects to object manager. 
+    # It does not however, publish it to the rest server
+    def manage_objects(self):
+        while (self.running):
+            # If left side is true, return get_objects()
+            stale = get_objects() or {}
+            # Add n to the list if it satisfies the predicate, if its a Target/Obstacle 
+            # and not managed by the object_manager.
+            orphans = [n for n in stale
+                        if ("Target" in n or "Obstacle" in n) and n not in self.parent.object_manager.objects]
+            # If non-empty, update the object_manager.objects dict with 'orphan' key:value pair 
+            # (Iterating over a dict iterates over its keys)
+            if orphans:
+                self.parent.object_manager.objects.update({n:stale[n] for n in orphans})
+                print("adopted %d orphaned object(s) from a previous session: %s"
+                        % (len(orphans), orphans))
+
+
 # Main GUI Window; massive class, generated with PyQt5
 class AutoDeploy(QMainWindow): 
     def __init__(self):
         super().__init__()
+
         self.object_manager = None
         self.thread_scots = None
+        self.thread_objects = None
+
+
         self.controller_ready = False
         self.controller_proc = None       # the running closed loop, if any
 
@@ -370,18 +399,18 @@ class AutoDeploy(QMainWindow):
 
         #Setup buttons at the top
         self.setup_complete = False
-        #self.start_environment
+        #self.init_environment
         self.btn_env = QPushButton("Initialize Environment", self)
-        self.btn_env.clicked.connect(self.start_environment)
+        self.btn_env.clicked.connect(self.init_environment)
         self.btn_env.setFont(self.font)
         # Synthesize and Run used to be combined; it is separate in this program to allow 
         # for the running of a program twice without resynthesis.
-        #self.start_symbolic
+        #self.synthesize_controller
         self.btn_synth = QPushButton("Synthesize Controller", self)
-        self.btn_synth.clicked.connect(self.start_symbolic)
+        self.btn_synth.clicked.connect(self.synthesize_controller)
         self.btn_synth.setFont(self.font)
         self.btn_synth.setEnabled(False)
-        #self.toggle_controller
+        #self.run_controller
         self.btn_run = QPushButton("Run Controller", self)
         self.btn_run.clicked.connect(self.toggle_controller)
         self.btn_run.setFont(self.font)
@@ -419,7 +448,8 @@ class AutoDeploy(QMainWindow):
         self.canvas.mousePressEvent = self.canvas_press_event
         self.canvas.mouseReleaseEvent = self.canvas_release_event
         self.canvas.mouseMoveEvent = self.canvas_move_event
-        self.thread_canvas = CanvasThread(self)
+
+
         self.thread_canvas.changePixmap.connect(self.set_canvas_image)
 
         # setup edit view
@@ -583,7 +613,7 @@ class AutoDeploy(QMainWindow):
 
 
     # Important! Launches everything else
-    def start_environment(self):  # function to start necessay software environments in sequence ~30s
+    def init_environment(self):  # function to start necessay software environments in sequence ~30s
         self.btn_env.setEnabled(False)
         self.motive = None
         self.ventuz = None
@@ -601,6 +631,14 @@ class AutoDeploy(QMainWindow):
         self.localization_server = subprocess.Popen(["cmd.exe", "/c", "start_admin.bat"], cwd="/mnt/d/Workspace/OptiTrackRESTServer")
         QtTest.QTest.qWait(2000)
         self.activateWindow()
+
+        # Referring to ObjectManager.py
+        # Instantiate an ObjectManager
+        self.object_manager = ObjectManager.ObjectManager()
+
+        self.thread_objects = ObjectThread(self)
+        self.thread_objects.start()
+        self.thread_objects.objects.connect(lambda objects: [self.object_manager.addObject(object) for object in objects])
 
         #Start Ventuz!
         if ENABLE_PROJECTION:
@@ -627,26 +665,8 @@ class AutoDeploy(QMainWindow):
         #TODO Could cause problems later... should check if file exists before running
         self.btn_run.setEnabled(self.controller_ready)
 
-        # Referring to ObjectManager.py
-        # Instantiate an ObjectManager
-        self.object_manager = ObjectManager.ObjectManager()
-
-
-        # This adoption block runs once, when the environment is initialized
-        # If left side is true, return get_objects()
-        stale = get_objects() or {}
-        # Add n to the list if it satisfies the predicate, if its a Target/Obstacle 
-        # and not managed by the object_manager.
-        orphans = [n for n in stale
-                   if ("Target" in n or "Obstacle" in n) and n not in self.object_manager.objects]
-        # If non-empty, update object_manager with 'orphan' key:value pair 
-        if orphans:
-            self.object_manager.objects.update({n:stale[n] for n in orphans})
-            print("adopted %d orphaned object(s) from a previous session: %s"
-                  % (len(orphans), orphans))
-            
         self.thread_canvas.start()
-
+        
         # True if you can reach the objects
         reachable = get_objects() is not None
         msg = "Environment initialized. Tracking %s." % ("OK" if reachable else "NOT reachable")
@@ -723,7 +743,7 @@ class AutoDeploy(QMainWindow):
         lay.addWidget(view)
         dlg.exec_()
 
-    def start_symbolic(self):
+    def synthesize_controller(self):
         """Harvest arena -> write config -> make && ./go2_controller.
 
         Synthesis only. Deployment is the separate Run button, so a long
@@ -855,6 +875,7 @@ class AutoDeploy(QMainWindow):
                         height = self.textbox_height.text()
                     f1, f2 = world_to_fields(x, y)
                     values = ["0", str(f1), str(f2), "0", "0", width, height]
+                    # This is where the GUI publishes to the localization server
                     self.object_manager.addObject(self.object_manager.getValidObjectName(self.checked_object_type), ",".join(values))
                     self.status.showMessage(self.checked_object_type + " placed at x=" + str(x)[:5] + " y=" + str(y)[:5])
                     self.checked_object_type = "None"
