@@ -1,4 +1,4 @@
-import sys, os, math, requests, paramiko, json, keyboard, cv2, subprocess
+import sys, os, math, requests, paramiko, time, json, keyboard, cv2, subprocess
 from PyQt5.QtGui import *
 from PyQt5.QtCore import *
 from PyQt5.QtWidgets import *
@@ -17,12 +17,14 @@ CAMERA_RESOLUTION = (1280, 720) # 16:9
 ENABLE_CAMERA = False
 ENABLE_PROJECTION = False
 
-default_object_sizes = {
-    # In Meters
-    "GO2":("0.31", "0.70"), 
-    "Target":("1", "1"), 
-    "Obstacle":("3.0", "0.4")
-}
+object = None
+
+# default_object_sizes = {
+#     # In Meters
+#     "GO2":("0.31", "0.70"), 
+#     "Target":("1", "1"), 
+#     "Obstacle":("3.0", "0.4")
+# }
 
 # Start here!
 if __name__=="__main__":
@@ -219,6 +221,7 @@ def state_arena_to_world(state): # translate the position tuple in pixels to wor
     world_y = state[1]/(SIM_HEIGHT/(X_UB[1] - X_LB[1] + X_ETA[1])) + X_LB[1] - X_ETA[1]/2
     return [world_x, world_y]
 
+# Separate Thread to manage the Camera
 class CameraThread(QThread):
     changePixmap = pyqtSignal(QPixmap)
     def run(self):
@@ -228,6 +231,7 @@ class CameraThread(QThread):
                 image = cv2.rotate(cv2.cvtColor(cv2.resize(image,(640,360)),cv2.COLOR_BGR2RGB),cv2.cv2.ROTATE_180)
                 self.changePixmap.emit(pil2pixmap(Image.fromarray(image).convert("RGBA")))
 
+# Separate Thread to manage the simulation drawing.
 class CanvasThread(QThread):
     changePixmap = pyqtSignal(QPixmap)
     def run(self):
@@ -237,16 +241,24 @@ class CanvasThread(QThread):
             self.changePixmap.emit(pil2pixmap(img))
             ndiImgSender.send_image(img_bytes, SIM_WIDTH, SIM_HEIGHT)
 
+# TODO
+# Separate thread to manage the addition of objects to the ObjectManager
+# Get rid of Object manager, do everything thru objectthread
+# self.canvas_release_event.connect(thread_object.push_to_localization_server)
+# Must call restDELjson when GUI object is deleted
 class ObjectThread(QThread):
     objects = pyqtSignal(dict)
     
     def __init__(self, parent):
         super.__init__(parent)  
         self.running = True
+        
 
     # Right now, assuming the following method runs repeatedly, it publishes any new tracked objects to object manager. 
     # It does not however, publish it to the rest server
-    def manage_objects(self):
+    
+    def run(self):
+        global objects
         while (self.running):
             # If left side is true, return get_objects()
             stale = get_objects() or {}
@@ -257,9 +269,21 @@ class ObjectThread(QThread):
             # If non-empty, update the object_manager.objects dict with 'orphan' key:value pair 
             # (Iterating over a dict iterates over its keys)
             if orphans:
-                self.parent.object_manager.objects.update({n:stale[n] for n in orphans})
+                objects.update({n:stale[n] for n in orphans})
                 print("adopted %d orphaned object(s) from a previous session: %s"
                         % (len(orphans), orphans))
+
+            time.sleep(5)
+
+    
+
+class SynthesisThread(QThread):
+    def __init__(self, parent):
+        super.__init__(parent)
+        self.running = True
+    def run(self):
+        while (self.running):
+
 
 
 # Main GUI Window; massive class, generated with PyQt5
@@ -450,7 +474,7 @@ class AutoDeploy(QMainWindow):
         self.canvas.mouseMoveEvent = self.canvas_move_event
 
 
-        self.thread_canvas.changePixmap.connect(self.set_canvas_image)
+        
 
         # setup edit view
         self.hbox_edit = QHBoxLayout()
@@ -638,7 +662,6 @@ class AutoDeploy(QMainWindow):
 
         self.thread_objects = ObjectThread(self)
         self.thread_objects.start()
-        self.thread_objects.objects.connect(lambda objects: [self.object_manager.addObject(object) for object in objects])
 
         #Start Ventuz!
         if ENABLE_PROJECTION:
@@ -665,6 +688,8 @@ class AutoDeploy(QMainWindow):
         #TODO Could cause problems later... should check if file exists before running
         self.btn_run.setEnabled(self.controller_ready)
 
+
+        self.thread_canvas.changePixmap.connect(self.set_canvas_image)
         self.thread_canvas.start()
         
         # True if you can reach the objects
@@ -744,16 +769,9 @@ class AutoDeploy(QMainWindow):
         dlg.exec_()
 
     def synthesize_controller(self):
-        """Harvest arena -> write config -> make && ./go2_controller.
+        # Collect geometry -> write config -> make && ./go2_controller.
 
-        Synthesis only. Deployment is the separate Run button, so a long
-        synthesis never surprises you by putting a robot in motion when it
-        finishes.
-        """
-        if self.thread_scots is not None and self.thread_scots.isRunning():
-            self.status.showMessage("Synthesis already running...")
-            return
-
+        # Disappear the button
         self.btn_synth.setEnabled(False)
         self.btn_synth.setText("Synthesizing...")
         self.log_view.clear()
@@ -761,11 +779,6 @@ class AutoDeploy(QMainWindow):
         global path_tail
         path_tail = []
 
-        self.thread_scots = SCOTSDeploy.SynthesisThread(
-            geometry_provider=self.collect_geometry,
-            state_lb=X_LB,
-            state_ub=X_UB,
-            parent=self)
         self.thread_scots.log.connect(self.append_log)
         self.thread_scots.finished_ok.connect(self.on_synthesis_done)
         self.thread_scots.start()
@@ -786,7 +799,7 @@ class AutoDeploy(QMainWindow):
         self.controller_ready = ok or controller_exists()
         self.btn_run.setEnabled(self.controller_ready)
         if ok:
-            self.status.showMessage("Controller ready. Press Run Controller to deploy.")
+            self.status.showMessage("Controllfer ready. Press Run Controller to deploy.")
         else:
             self.status.showMessage("Synthesis failed -- see log above. "
                                     "Empty winning set usually means the input grid "
@@ -917,6 +930,7 @@ class AutoDeploy(QMainWindow):
 
         self._shutdown_thread(self.thread_camera)
         self._shutdown_thread(self.thread_canvas)
+        self._shutdown_thread(self.thread_objects)
         self._shutdown_thread(self.thread_scots)
 
         try:
